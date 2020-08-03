@@ -1,9 +1,11 @@
 import { flags, SfdxCommand } from '@salesforce/command';
 import { Messages, SfdxError, Connection } from '@salesforce/core';
 import { AnyJson } from '@salesforce/ts-types';
-import { ExecuteOptions } from 'jsforce';
+import { ExecuteOptions, FieldType, DescribeSObjectResult } from 'jsforce';
+import * as MaskData from 'maskdata';
 import * as fs from 'fs';
 import * as path from 'path';
+import { isArray } from 'util';
 const util = require("util");
 
 interface DataPlan {
@@ -11,7 +13,39 @@ interface DataPlan {
   label: string;
   filters: string;
   excludedFields: Array<string>;
+  orderBy?: Array<string>;
+  limit?: number;
+  offset?: number;
+  maskedFields?: Array<MaskOption>;
 }
+
+enum MaskType {
+  EMAIL = 'email',
+  PHONE = 'phone',
+  PASSWORD = 'password',
+  CARD = 'card',
+  STRING = 'string'
+}
+
+interface BaseMaskOption {
+  maskType: MaskType;
+  maskWith: string;
+  unmaskedStartDigits?: number;
+  unmaskedEndDigits?: number;
+  unmaskedStartCharactersBeforeAt?: number;
+  unmaskedEndCharactersAfterAt?: number;
+  maskAtTheRate?: boolean;
+}
+
+interface NamedMaskOption extends BaseMaskOption {
+  fieldNames: Array<String>;
+}
+
+interface TypedMaskOption extends BaseMaskOption {
+  fieldType: FieldType;
+}
+
+type MaskOption = NamedMaskOption | TypedMaskOption;
 
 // Initialize Messages with the current plugin directory
 Messages.importMessagesDirectory(__dirname);
@@ -23,6 +57,7 @@ let conn:Connection;
 let objectList:Array<DataPlan>;
 let lastReferenceIds: Map<string, number> = new Map<string, number>();
 let globallyExcludedFields: Array<string>;
+let globallyMaskedFields: Array<MaskOption>;
 
 export default class Export extends SfdxCommand {
 
@@ -74,6 +109,11 @@ export default class Export extends SfdxCommand {
       if (dataPlan.excludedFields) {
         globallyExcludedFields = dataPlan.excludedFields;
       }
+
+      // If there are some globally masked fields, add them
+      if (dataPlan.maskedFields) {
+        globallyMaskedFields = dataPlan.maskedFields;
+      }
     }
     else {
       throw new SfdxError(`Either objects or dataplan flag is mandatory`);
@@ -102,7 +142,7 @@ export default class Export extends SfdxCommand {
     let fields = [];
     let lookups = [];
     let userFieldsReference = [];
-    const describeResult = await conn.sobject(sobject.name).describe();
+    const describeResult:DescribeSObjectResult = await conn.sobject(sobject.name).describe();
 
     const sObjectLabel = describeResult.label;
 
@@ -112,9 +152,15 @@ export default class Export extends SfdxCommand {
       fieldsToExclude = fieldsToExclude.concat(sobject.excludedFields);
     }
 
+    // Add fields to mask, if any
+    let fieldsToMask: Array<MaskOption> = globallyMaskedFields ? globallyMaskedFields : [];
+    if (sobject.maskedFields) {
+      fieldsToMask = fieldsToMask.concat(sobject.maskedFields);
+    }
+
     for (const field of describeResult.fields) {
       if (field.createable && !fieldsToExclude.includes(field.name)) {
-        
+
         fields.push(field.name);
         // If it's a lookup, also add it to the lookup list, to be replaced later
         // Excluding OwnerId as we are not importing users anyway
@@ -135,7 +181,7 @@ export default class Export extends SfdxCommand {
     if (describeResult.recordTypeInfos.length > 1) {
 
       // Looks like that there is always at least 1 RT (Master) returned by the describe
-      // So having more than 2 means there are some custom RT created 
+      // So having more than 2 means there are some custom RT created
       // Is there a better way to do this ?
       fields.push('RecordType.DeveloperName');
     }
@@ -144,34 +190,52 @@ export default class Export extends SfdxCommand {
     if (sobject.name === 'Pricebook2') {
       fields.push('IsStandard');
     }
-    
+
     // Query to get sObject data
     const recordQuery = `SELECT Id, ${fields.join()}
                          FROM ${sobject.name}
-                         ${sobject.filters ? 'WHERE '+sobject.filters : ''}`;
+                         ${sobject.filters ? 'WHERE '+sobject.filters : ''}
+                         ${sobject.orderBy ? 'ORDER BY '+sobject.orderBy : ''}
+                         ${sobject.limit ? 'LIMIT '+sobject.limit : ''}
+                         ${sobject.offset ? 'OFFSET '+sobject.offset : ''}
+                         `;
     // API Default limit is 10 000, just check if we need to extend it
     const recordNumber:number = ((await conn.query(`Select count(Id) numberOfRecords from ${sobject.name}`)).records[0] as any).numberOfRecords;
     let options:ExecuteOptions = {};
     if (recordNumber > 10000) {
       options.maxFetch = recordNumber;
     }
-    const recordResults = (await conn.autoFetchQuery(recordQuery, options)).records;
+    const recordResults: Array<any> = (await conn.autoFetchQuery(recordQuery, options)).records;
 
     // Replace Lookup Ids + Record Type Ids by references
-    await this.cleanJsonRecord(sobject, sObjectLabel, recordResults, recordIdsMap, lookups, userFieldsReference);
+    await this.cleanJsonRecord(sobject, sObjectLabel, recordResults, recordIdsMap, lookups, userFieldsReference, fieldsToMask, describeResult);
 
     return recordResults;
   }
 
   // Clean JSON to have the same output format as force:data:tree:export
   // Main difference: RecordTypeId is replaced by DeveloperName
-  private async cleanJsonRecord(sobject: DataPlan, objectLabel: string, records, recordIdsMap, lookups: Array<string>, userFieldsReference: Array<string>,) {
+  private async cleanJsonRecord(
+    sobject: DataPlan,
+    objectLabel: string,
+    records: Array<any>,
+    recordIdsMap: Map<string, string>,
+    lookups: Array<string>,
+    userFieldsReference: Array<string>,
+    fieldsToMask: Array<MaskOption>,
+    describeResult: DescribeSObjectResult,
+  ) {
 
     let refId = 0;
     // If this object was already exported before, start the numbering after the last one already used
     if (lastReferenceIds.get(objectLabel)) {
       refId = lastReferenceIds.get(objectLabel);
     }
+
+    const maskMap: Map<String, MaskOption> = this.mapFieldToMaskOption(
+      fieldsToMask,
+      describeResult
+    );
 
     for (const record of records) {
 
@@ -185,12 +249,12 @@ export default class Export extends SfdxCommand {
       else {
 
         // Add the new ReferenceId
-        if (sobject.name === 'Pricebook2' && record.IsStandard) { 
+        if (sobject.name === 'Pricebook2' && record.IsStandard) {
           // Specific use case for Standard Price Book that will need to be queried from target org
           // TODO: Maybe not even save this record
           const standardPriceBookLabel = 'StandardPriceBook';
           record.attributes.referenceId = standardPriceBookLabel;
-          recordIdsMap.set(record.Id, standardPriceBookLabel);    
+          recordIdsMap.set(record.Id, standardPriceBookLabel);
         }
         else {
           refId++;
@@ -214,6 +278,24 @@ export default class Export extends SfdxCommand {
         record[userField] = 'SfdxOrgUser';
       }
 
+      for (const key of Object.keys(record)) {
+        if (!record[key]) {
+          continue;
+        }
+        const maskOption: MaskOption = maskMap.get(key);
+        if (!maskOption) {
+          continue;
+        }
+        switch (maskOption.maskType) {
+          case 'email':
+            record[key] = MaskData.maskEmail2(record[key], maskOption);
+            break;
+          case 'phone':
+            record[key] = MaskData.maskPhone(record[key], maskOption);
+            break;
+        }
+      }
+
       // TODO: As we are now iterating on all fields to remove null values:
       // --> refactor all previous for loops to do the work here
       // FIXME: Exclude value at 0 for now :'(
@@ -233,6 +315,31 @@ export default class Export extends SfdxCommand {
     lastReferenceIds.set(objectLabel, refId);
   }
 
+  private mapFieldToMaskOption(
+    fieldsToMask: Array<MaskOption>,
+    describeResult: DescribeSObjectResult
+  ): Map<String, MaskOption> {
+    const result: Map<String, MaskOption> = new Map<String, MaskOption>();
+
+    if (!fieldsToMask || fieldsToMask.length === 0) {
+      return result;
+    }
+
+    for (const fieldToMask of fieldsToMask) {
+      for (const field of describeResult.fields) {
+        if (
+          (!!(fieldToMask as TypedMaskOption).fieldType &&
+            (fieldToMask as TypedMaskOption).fieldType === field.type) ||
+          (isArray((fieldToMask as NamedMaskOption).fieldNames) &&
+            (fieldToMask as NamedMaskOption).fieldNames.includes(field.name))
+        ) {
+          result.set(field.name, fieldToMask);
+        }
+      }
+    }
+    return result;
+  }
+
   private async saveFile(records: {}[], fileName: string) {
 
     // Save results in a file
@@ -243,7 +350,7 @@ export default class Export extends SfdxCommand {
         fileName
       );
     }
-    
+
     // Write product.json file
     const saveToPath = path.join(
       process.cwd(),
